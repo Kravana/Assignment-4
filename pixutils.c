@@ -1,6 +1,9 @@
 #include "pixutils.h"
 #include "bmp/bmp.h"
 
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
 //private methods -> make static
 static pixMap* pixMap_init();
 static pixMap* pixMap_copy(pixMap *p);
@@ -78,18 +81,37 @@ int pixMap_write_bmp16(pixMap *p,char *filename){
  BMP16map *bmp16=BMP16map_init(p->imageHeight,p->imageWidth,0,5,6,5); //initialize the bmp type
  if(!bmp16) return 1;
  
-
 	//bmp16->pixArray[i][j] is 2-d array for bmp files. It is analogous to the one for our png file pixMaps except that it is 16 bits
 	
  //However pixMap and BMP16_map are "upside down" relative to each other
  //need to flip one of the the row indices when copying
-
- BMP16map_write(bmp16,filename);
- BMP16map_destroy(&bmp16);
- return 0;
+	uint16_t rMask = ((1 << bmp16->Rbits) - 1) << (8 - bmp16->Rbits);
+	uint16_t gMask = ((1 << bmp16->Gbits) - 1) << (8 - bmp16->Gbits);
+	uint16_t bMask = ((1 << bmp16->Bbits) - 1) << (8 - bmp16->Bbits);
+	for (int i = 0; i < p->imageHeight; i++) {
+		for (int j = 0; j < p->imageWidth; j++) {
+			uint16_t pix16 = 0;
+			uint16_t r16 = p->pixArray_overlay[p->imageHeight - 1 - i][j].r;
+			uint16_t g16 = p->pixArray_overlay[p->imageHeight - 1 - i][j].g;
+			uint16_t b16 = p->pixArray_overlay[p->imageHeight - 1 - i][j].b;
+			r16 = (r16 & rMask) << 8;
+			g16 = (g16 & gMask) << (8 - bmp16->Rbits);
+			b16 = (b16 & bMask) >> (8 - bmp16->Bbits);
+			pix16 = r16 | g16 | b16;
+			bmp16->pixArray[i][j] = pix16;
+		}
+	}
+	
+	BMP16map_write(bmp16,filename);
+	BMP16map_destroy(&bmp16);
+	return 0;
 }	 
 void plugin_destroy(plugin **plug){
- //free the allocated memory and set *plug to zero (NULL)	
+ //free the allocated memory and set *plug to zero (NULL)
+	if ((*plug)->data) {
+		free((*plug)->data);
+	}
+ free(*plug);
 }
 
 plugin *plugin_parse(char *argv[] ,int *iptr){
@@ -100,46 +122,103 @@ plugin *plugin_parse(char *argv[] ,int *iptr){
 	
 	int i=*iptr;
 	if(!strcmp(argv[i]+2,"rotate")){
+  new->function=rotate;
+  new->data=malloc(2 *sizeof(float));
+  float *sc=(float*) new->data;
+  int i=*iptr;
+  float theta=atof(argv[i+1]);
+  sc[0]=sin(degreesToRadians(-theta));
+	 sc[1]=cos(degreesToRadians(-theta));
 		//code goes here
 		*iptr=i+2;
 		return new;	
 	}	
 	if(!strcmp(argv[i]+2,"convolution")){
 				//code goes here
+		new->function = convolution;
+		new->data = malloc(9 * sizeof(float));
+		float *kernelMatrix = (float*) new->data;
+		int k = *iptr;
+		for (int j = 1; j < 10; j++) {
+			kernelMatrix[j - 1] = atof(argv[k + j]);
+		}
 		*iptr=i+10;	
-  return new;
+		return new;
 	}
 	if(!strcmp(argv[i]+2,"flipHorizontal")){
 			//code goes here	
-  *iptr=i+1;
-  return new;
+		new->function = flipHorizontal;	
+		*iptr=i+1;
+		return new;
 	}
 	if(!strcmp(argv[i]+2,"flipVertical")){
 		//code goes here
-  *iptr=i+1;
-  return new;
+		new->function = flipVertical;
+		*iptr=i+1;
+		return new;
 	}		
 	return(0);
 }	
 
 //define plugin functions
 
-static void rotate(pixMap *p, pixMap *oldPixMap,int y, int x,void *data){
-	
+static void rotate(pixMap *p, pixMap *oldPixMap,int i, int j,void *data){
+ float *sc=(float*) data;
+ const float ox=p->imageWidth/2.0f;
+ const float oy=p->imageHeight/2.0f;
+ const float s=sc[0];
+	const float c=sc[1];
+	const int y=i;
+	const int x=j;
+	float rotx = c*(x-ox) - s * (oy-y) + ox;
+ float roty = -(s*(x-ox) + c * (oy-y) - oy);
+ int rotj=rotx+.5;
+	int roti=roty+.5; 
+	if(roti >=0 && roti < oldPixMap->imageHeight && rotj >=0 && rotj < oldPixMap->imageWidth){
+   memcpy(p->pixArray_overlay[y]+x,oldPixMap->pixArray_overlay[roti]+rotj,sizeof(rgba));			 
+		}
+		else{
+   memset(p->pixArray_overlay[y]+x,0,sizeof(rgba));		
+		}		
 }
 
 static void convolution(pixMap *p, pixMap *oldPixMap,int i, int j,void *data){
 	//implement algorithm givne in https://en.wikipedia.org/wiki/Kernel_(image_processing)
 	//assume that the kernel is a 3x3 matrix of integers
 	//don't forget to normalize by dividing by the sum of all the elements in the matrix
+	double red = 0;
+	double green = 0;
+	double blue = 0;
+	float sum = 0;
+	
+	for (int y = 0; y < 3; y++) {
+		for (int x = 0; x < 3; x++) {
+			int corrY = i + (y - 1);
+			int corrX = j + (x - 1);
+			if (corrY < 0) corrY = 0;
+			if (corrX < 0) corrX = 0;
+			if (corrY >= oldPixMap->imageHeight) corrY = oldPixMap->imageHeight - 1;
+			if (corrX >= oldPixMap->imageWidth) corrX = oldPixMap->imageWidth - 1;
+			rgba *workedPix = oldPixMap->pixArray_overlay[corrY] + corrX;
+			float kernelElement = ((float*)data)[(2 * 3 - y * 3) + (2 - x)];
+			red += workedPix->r * kernelElement;
+			green += workedPix->g * kernelElement;
+			blue += workedPix->b * kernelElement;
+			sum += ((float*)data)[(2 * 3 - y * 3) + (2 - x)];
+		}
+	}
+	p->pixArray_overlay[i][j].r = MIN(MAX((red / sum), 0), 255);
+	p->pixArray_overlay[i][j].g = MIN(MAX((green / sum), 0), 255);
+	p->pixArray_overlay[i][j].b = MIN(MAX((blue / sum), 0), 255);
 }
 
 //very simple functions - does not use the data pointer - good place to start
  
 static void flipVertical(pixMap *p, pixMap *oldPixMap,int i, int j,void *data){
  //reverse the pixels vertically - can be done in one line		
+ memcpy(p->pixArray_overlay[p->imageHeight - 1 - i] + j, oldPixMap->pixArray_overlay[i] + j, sizeof(rgba));
 }	 
 static void flipHorizontal(pixMap *p, pixMap *oldPixMap,int i, int j,void *data){
  //reverse the pixels horizontally - can be done in one line
- 
+ memcpy(p->pixArray_overlay[i] + p->imageWidth - 1 - j, oldPixMap->pixArray_overlay[i] + j, sizeof(rgba));
 }
